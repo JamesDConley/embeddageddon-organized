@@ -70,7 +70,7 @@ class EmbeddingAutoencoder(nn.Module):
         self.output_layer = nn.Linear(prev_dim, input_dim)
 
         # Activation and dropout layers (shared)
-        self.dropout = nn.Dropout(0.1)
+        #self.dropout = nn.Dropout(0.1)
         self.silu = nn.SiLU()  # Swish activation
 
     def configure_subnetwork(self, flag: str):
@@ -95,7 +95,7 @@ class EmbeddingAutoencoder(nn.Module):
             encoded = self.encoder_layers[i](encoded)
             encoded = self.encoder_rms_norms[i](encoded)
             encoded = self.silu(encoded)
-            encoded = self.dropout(encoded)
+            #encoded = self.dropout(encoded)
 
         # Bottleneck
         encoded = self.bottleneck_layer(encoded)
@@ -114,7 +114,7 @@ class EmbeddingAutoencoder(nn.Module):
             decoded = self.decoder_layers[i](decoded)
             decoded = self.decoder_rms_norms[i](decoded)
             decoded = self.silu(decoded)
-            decoded = self.dropout(decoded)
+            #decoded = self.dropout(decoded)
 
         # Output layer
         decoded = self.output_layer(decoded)
@@ -129,7 +129,7 @@ class EmbeddingAutoencoder(nn.Module):
             encoded = self.encoder_layers[i](encoded)
             encoded = self.encoder_rms_norms[i](encoded)
             encoded = self.silu(encoded)
-            encoded = self.dropout(encoded)
+            #encoded = self.dropout(encoded)
 
         encoded = self.bottleneck_layer(encoded)
         encoded = self.bottleneck_tanh(encoded)
@@ -165,4 +165,6 @@ def masked_mse_loss(predictions: torch.Tensor, targets: torch.Tensor,
     if total_masked_elements > 0:
         return masked_diffs.sum() / total_masked_elements
     else:
+        print("All elements masked. This means there's no signal for this batch!")
+        raise ValueError("All elements masked. This means there's no signal for this batch!")
         return torch.tensor(0.0, device=predictions.device)

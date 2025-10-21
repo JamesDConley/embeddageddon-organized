@@ -1,0 +1,7 @@
+For some reason, the autoencoder outputs are now like all full 1s or -1s 
+There must be a bug in the refactor somehow.
+
+Possible causes
+- Dataset changes (memmap/preloaded dataset for autoencoder)
+- Batch size increase from ~64ish to 8192 (though this seems weird)
+- Reorg of autoencoder code? Unclear.
