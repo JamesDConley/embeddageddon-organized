@@ -6,7 +6,7 @@ import torch
 class EmbeddingAutoencoder(nn.Module):
     """Autoencoder for multi-model token embeddings with RMSNorm, SiLU, and random subnetwork masking."""
 
-    def __init__(self, input_dim: int, bottleneck_dim: int, hidden_dims: Optional[List[int]] = None):
+    def __init__(self, input_dim: int, bottleneck_dim: int, hidden_dims: Optional[List[int]] = None, use_tanh: bool = False):
         """
         Initialize the autoencoder.
 
@@ -14,11 +14,13 @@ class EmbeddingAutoencoder(nn.Module):
             input_dim: Total dimension of concatenated input embeddings
             bottleneck_dim: Dimension of the bottleneck layer
             hidden_dims: Optional list of hidden layer dimensions
+            use_tanh: Whether to use tanh activation on bottleneck (default: False for linear)
         """
         super().__init__()
 
         self.input_dim = input_dim
         self.bottleneck_dim = bottleneck_dim
+        self.use_tanh = use_tanh
 
         # Scale factors for subnetwork sizes: s, m, l, xl
         self.scale_factors = [1/8, 1/4, 1/2, 1.0]
@@ -48,8 +50,11 @@ class EmbeddingAutoencoder(nn.Module):
 
         # Bottleneck layer
         self.bottleneck_layer = nn.Linear(prev_dim, bottleneck_dim)
-        # Tanh activation after bottleneck
-        self.bottleneck_tanh = nn.Tanh()
+        # Optional tanh activation after bottleneck
+        if use_tanh:
+            self.bottleneck_activation = nn.Tanh()
+        else:
+            self.bottleneck_activation = None
 
         # Decoder layers with RMSNorm (mirror of encoder)
         self.decoder_layers = nn.ModuleList()
@@ -86,8 +91,17 @@ class EmbeddingAutoencoder(nn.Module):
         scale = self.scale_factors[idx]
         self.current_subset_hd = int(self.bottleneck_dim * scale)
 
-    def forward(self, x):
-        """Forward pass through the autoencoder with RMSNorm, SiLU, and random subnetwork masking."""
+    def forward(self, x, return_l2_penalty=False):
+        """Forward pass through the autoencoder with RMSNorm, SiLU, and random subnetwork masking.
+        
+        Args:
+            x: Input tensor
+            return_l2_penalty: If True, also return the L2 penalty on embeddings
+            
+        Returns:
+            decoded: Reconstructed output
+            l2_penalty: (optional) L2 penalty if return_l2_penalty=True
+        """
         # Encoder forward pass
         encoded = x
 
@@ -99,13 +113,22 @@ class EmbeddingAutoencoder(nn.Module):
 
         # Bottleneck
         encoded = self.bottleneck_layer(encoded)
-        encoded = self.bottleneck_tanh(encoded)
+        if self.bottleneck_activation is not None:
+            encoded = self.bottleneck_activation(encoded)
 
         # Apply subnetwork mask if configured
         if self.current_subset_hd is not None:
             mask = torch.zeros_like(encoded)
             mask[:, :self.current_subset_hd] = 1.0
             encoded = encoded * mask
+
+        # Note the L2 penalty will naturally be lower here for 
+        # The smaller networks. I'm kinda vibing with that though
+        # Seems fine
+        # Compute L2 penalty if requested (before decoding)
+        l2_penalty = None
+        if return_l2_penalty:
+            l2_penalty = self.get_embedding_l2_penalty(encoded)
 
         # Decoder forward pass
         decoded = encoded
@@ -118,7 +141,9 @@ class EmbeddingAutoencoder(nn.Module):
 
         # Output layer
         decoded = self.output_layer(decoded)
-
+        
+        if return_l2_penalty:
+            return decoded, l2_penalty
         return decoded
 
     def encode(self, x):
@@ -132,7 +157,8 @@ class EmbeddingAutoencoder(nn.Module):
             #encoded = self.dropout(encoded)
 
         encoded = self.bottleneck_layer(encoded)
-        encoded = self.bottleneck_tanh(encoded)
+        if self.bottleneck_activation is not None:
+            encoded = self.bottleneck_activation(encoded)
 
         if self.current_subset_hd is not None:
             mask = torch.zeros_like(encoded)
@@ -141,7 +167,19 @@ class EmbeddingAutoencoder(nn.Module):
 
         return encoded
 
-def masked_mse_loss(predictions: torch.Tensor, targets: torch.Tensor, 
+    def get_embedding_l2_penalty(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate L2 penalty (L2 norm squared) on the embeddings.
+        
+        Args:
+            embeddings: The bottleneck embeddings from encode() or forward()
+            
+        Returns:
+            L2 penalty scalar
+        """
+        return torch.mean(embeddings ** 2)
+
+def masked_mse_loss(predictions: torch.Tensor, targets: torch.Tensor,
                    masks: torch.Tensor) -> torch.Tensor:
     """
     Calculate MSE loss only for masked (non-zero) elements.

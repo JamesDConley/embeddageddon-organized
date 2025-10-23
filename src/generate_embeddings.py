@@ -115,13 +115,14 @@ def collect_token_embeddings(token: str, embedding_dicts: Dict[str, Dict[str, np
     return np.concatenate(embeddings_parts, axis=0)
 
 
-def load_trained_encoder(encoder_path: str, input_dim: int, bottleneck_dim: int) -> Optional[EmbeddingAutoencoder]:
+def load_trained_encoder(encoder_path: str, input_dim: int, bottleneck_dim: int, use_tanh: bool = False) -> Optional[EmbeddingAutoencoder]:
     """Load a pre-trained encoder model.
     
     Args:
         encoder_path: Path to the saved encoder model
         input_dim: Expected input dimension
         bottleneck_dim: Expected bottleneck dimension
+        use_tanh: Whether to use tanh activation on bottleneck (default: False)
         
     Returns:
         Loaded encoder model or None if not found
@@ -130,11 +131,11 @@ def load_trained_encoder(encoder_path: str, input_dim: int, bottleneck_dim: int)
         logger.warning(f"Encoder model not found at {encoder_path}")
         return None
     
-    encoder = EmbeddingAutoencoder(input_dim, bottleneck_dim)
+    encoder = EmbeddingAutoencoder(input_dim, bottleneck_dim, use_tanh=use_tanh)
     encoder.load_state_dict(torch.load(encoder_path, map_location='cpu')["model_state_dict"])
     encoder.eval()
     encoder.to("cuda")
-    logger.info(f"Loaded encoder from {encoder_path}")
+    logger.info(f"Loaded encoder from {encoder_path} (tanh: {use_tanh})")
     return encoder
 
 
@@ -270,6 +271,8 @@ def main():
                        help="Output directory for token mappings")
     parser.add_argument("--bottleneck_dim", type=int, default=7168,
                        help="Bottleneck dimension for encoder")
+    parser.add_argument("--use_tanh", action="store_true", default=False,
+                       help="Use tanh activation on bottleneck (default: False for linear)")
     
     args = parser.parse_args()
     
@@ -295,7 +298,7 @@ def main():
         
         # Load or create encoder
         
-        encoder = load_trained_encoder(args.encoder_model_path, total_input_dim, args.bottleneck_dim)
+        encoder = load_trained_encoder(args.encoder_model_path, total_input_dim, args.bottleneck_dim, use_tanh=args.use_tanh)
         assert encoder is not None, "Error loading encoder!"
 
 

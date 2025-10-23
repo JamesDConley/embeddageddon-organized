@@ -58,8 +58,9 @@ def save_training_config(output_dir: Path, args: argparse.Namespace, dataset: Me
         args: Command line arguments
         dataset: Training dataset
     """
+    activation_type = "tanh" if args.use_tanh else "linear"
     config = {
-        "training_type": "memmap_train_with_random_subnetwork",
+        "training_type": f"memmap_train_with_random_subnetwork_{activation_type}_l2",
         "training_args": {
             "preprocessed_dir": args.preprocessed_dir,
             "epochs": args.epochs,
@@ -68,7 +69,19 @@ def save_training_config(output_dir: Path, args: argparse.Namespace, dataset: Me
             "device": args.device,
             "use_amp": args.use_amp,
             "precision": args.precision,
-            "num_workers": args.num_workers
+            "num_workers": args.num_workers,
+            "l2_penalty_weight": args.l2_penalty_weight,
+            "use_tanh": args.use_tanh,
+            "weight_decay": args.weight_decay
+        },
+        "scheduler_info": {
+            "use_onecycle": args.use_onecycle,
+            "max_lr": args.learning_rate,
+            "pct_start": args.pct_start,
+            "div_factor": args.div_factor,
+            "final_div_factor": args.final_div_factor,
+            "initial_lr": args.learning_rate / args.div_factor if args.use_onecycle else args.learning_rate,
+            "final_lr": args.learning_rate / args.final_div_factor if args.use_onecycle else args.learning_rate
         },
         "dataset_info": {
             "total_tokens": len(dataset.common_tokens),
@@ -81,6 +94,11 @@ def save_training_config(output_dir: Path, args: argparse.Namespace, dataset: Me
             "scale_factors": [1/8, 1/4, 1/2, 1.0],
             "subnetwork_sizes": ["s", "m", "l", "xl"],
             "description": "Random subnetwork selection per batch"
+        },
+        "model_architecture": {
+            "bottleneck_activation": "tanh" if args.use_tanh else "linear",
+            "l2_regularization": True,
+            "l2_penalty_weight": args.l2_penalty_weight
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -100,7 +118,14 @@ def train_autoencoder(dataset: MemMapEmbeddingDataset,
                      device: str = "cuda" if torch.cuda.is_available() else "cpu",
                      use_amp: bool = True,
                      precision: str = "fp16",
-                     num_workers: int = 2) -> EmbeddingAutoencoder:
+                     num_workers: int = 2,
+                     l2_penalty_weight: float = 0.01,
+                     use_onecycle: bool = True,
+                     pct_start: float = 0.3,
+                     div_factor: float = 25.0,
+                     final_div_factor: float = 10000.0,
+                     use_tanh: bool = False,
+                     weight_decay: float = 0.0) -> EmbeddingAutoencoder:
     """
     Train the embedding autoencoder.
 
@@ -109,11 +134,18 @@ def train_autoencoder(dataset: MemMapEmbeddingDataset,
         output_dir: Directory to save all outputs
         num_epochs: Number of training epochs
         batch_size: Batch size for training
-        learning_rate: Learning rate for optimizer
+        learning_rate: Peak learning rate (max_lr for OneCycleLR if enabled, constant LR otherwise)
         device: Device to train on
         use_amp: Whether to use Automatic Mixed Precision
         precision: Precision mode for mixed precision training (fp16 or fp8)
         num_workers: Number of worker processes for data loading (0 = main process only)
+        l2_penalty_weight: Weight for L2 penalty on embeddings (default: 0.01)
+        use_onecycle: Whether to use OneCycleLR scheduler (default: True)
+        pct_start: Fraction of training spent in warmup phase (default: 0.3)
+        div_factor: Initial LR = max_lr / div_factor (default: 25.0)
+        final_div_factor: Final LR = max_lr / final_div_factor (default: 10000.0)
+        use_tanh: Whether to use tanh activation on bottleneck (default: False for linear)
+        weight_decay: Weight decay (L2 penalty on weights) for Adam optimizer (default: 0.0)
 
     Returns:
         Trained autoencoder model
@@ -133,12 +165,19 @@ def train_autoencoder(dataset: MemMapEmbeddingDataset,
     # Initialize model
     model = EmbeddingAutoencoder(
         input_dim=dataset.total_dim,
-        bottleneck_dim=dataset.bottleneck_dim
+        bottleneck_dim=dataset.bottleneck_dim,
+        use_tanh=use_tanh
     )
     model.to(device)
 
     # Initialize optimizer
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # If using OneCycleLR, initial LR will be set by the scheduler
+    if use_onecycle:
+        # Set a low initial LR; OneCycleLR will control the actual learning rate
+        initial_lr = learning_rate / div_factor
+        optimizer = optim.Adam(model.parameters(), lr=initial_lr, weight_decay=weight_decay)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     # Initialize AMP components if using mixed precision
     scaler = None
@@ -167,11 +206,37 @@ def train_autoencoder(dataset: MemMapEmbeddingDataset,
         print("Warning: AMP is only supported on CUDA devices. Falling back to FP32.")
         use_amp = False
 
+    # Initialize OneCycleLR scheduler if requested
+    scheduler = None
+    if use_onecycle:
+        steps_per_epoch = len(dataloader)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=learning_rate,
+            epochs=num_epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=pct_start,
+            anneal_strategy='cos',
+            div_factor=div_factor,
+            final_div_factor=final_div_factor
+        )
+        print(f"OneCycleLR Scheduler: Enabled")
+        print(f"  Max LR: {learning_rate}")
+        print(f"  Initial LR: {learning_rate / div_factor:.6f}")
+        print(f"  Final LR: {learning_rate / final_div_factor:.8f}")
+        print(f"  Warmup fraction: {pct_start}")
+        print(f"  Steps per epoch: {steps_per_epoch}")
+    else:
+        print(f"Learning Rate Scheduler: Disabled (constant LR: {learning_rate})")
+
     print(f"Training autoencoder on {device}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Training samples: {len(dataset)}")
+    print(f"Bottleneck Activation: {'Tanh' if use_tanh else 'Linear'}")
     print(f"Mixed Precision: {'Enabled' if use_amp else 'Disabled'}")
     print(f"Random Subnetwork Training: Enabled (s, m, l, xl)")
+    print(f"L2 Penalty Weight: {l2_penalty_weight}")
+    print(f"Weight Decay: {weight_decay}")
     print(f"Data loading: {num_workers} workers (memory-mapped)")
     print(f"Output directory: {output_dir}")
     print("-" * 60)
@@ -210,8 +275,9 @@ def train_autoencoder(dataset: MemMapEmbeddingDataset,
             if use_amp and scaler is not None:
                 # Mixed precision forward pass
                 with torch.amp.autocast("cuda", autocast_dtype):
-                    outputs = model(batch_inputs)
-                    loss = masked_mse_loss(outputs, batch_targets, batch_masks)
+                    outputs, l2_penalty = model(batch_inputs, return_l2_penalty=True)
+                    reconstruction_loss = masked_mse_loss(outputs, batch_targets, batch_masks)
+                    loss = reconstruction_loss + l2_penalty_weight * l2_penalty
 
                 # Mixed precision backward pass
                 scaler.scale(loss).backward()
@@ -219,15 +285,21 @@ def train_autoencoder(dataset: MemMapEmbeddingDataset,
                 scaler.update()
             else:
                 # Standard precision forward pass
-                outputs = model(batch_inputs)
-                loss = masked_mse_loss(outputs, batch_targets, batch_masks)
+                outputs, l2_penalty = model(batch_inputs, return_l2_penalty=True)
+                reconstruction_loss = masked_mse_loss(outputs, batch_targets, batch_masks)
+                loss = reconstruction_loss + l2_penalty_weight * l2_penalty
 
                 # Standard precision backward pass
                 loss.backward()
                 optimizer.step()
 
+            # Step the scheduler after each batch (if using OneCycleLR)
+            if scheduler is not None:
+                scheduler.step()
+
             # Cache loss.item() to avoid multiple GPU syncs
             batch_loss = loss.item()
+            current_lr = optimizer.param_groups[0]['lr']
             total_loss += batch_loss
             num_batches += 1
 
@@ -236,12 +308,12 @@ def train_autoencoder(dataset: MemMapEmbeddingDataset,
                 epoch=epoch + 1,
                 batch=batch_idx + 1,
                 batch_loss=batch_loss,
-                learning_rate=learning_rate,
+                learning_rate=current_lr,
                 batch_size=batch_size
             )
 
             # Update progress bar
-            progress_bar.set_postfix({"Loss": f"{batch_loss:.6f}", "Subnet": flag})
+            progress_bar.set_postfix({"Loss": f"{batch_loss:.6f}", "LR": f"{current_lr:.6f}", "Subnet": flag})
 
         # End epoch tracking
         avg_loss = loss_tracker.end_epoch(epoch + 1)
@@ -299,6 +371,22 @@ def main():
                        help="Precision mode for mixed precision training (fp16 or fp8)")
     parser.add_argument("--num_workers", type=int, default=2,
                        help="Number of worker processes for data loading (default: 2, use 0 to disable)")
+    parser.add_argument("--l2_penalty_weight", type=float, default=0.01,
+                       help="Weight for L2 penalty on embeddings (default: 0.01)")
+    parser.add_argument("--use_onecycle", action="store_true", default=True,
+                       help="Use OneCycleLR scheduler (default: True)")
+    parser.add_argument("--no_onecycle", dest="use_onecycle", action="store_false",
+                       help="Disable OneCycleLR scheduler")
+    parser.add_argument("--pct_start", type=float, default=0.3,
+                       help="Fraction of training in warmup phase for OneCycleLR (default: 0.3)")
+    parser.add_argument("--div_factor", type=float, default=25.0,
+                       help="Initial LR = max_lr / div_factor for OneCycleLR (default: 25.0)")
+    parser.add_argument("--final_div_factor", type=float, default=10000.0,
+                       help="Final LR = max_lr / final_div_factor for OneCycleLR (default: 10000.0)")
+    parser.add_argument("--use_tanh", action="store_true", default=False,
+                       help="Use tanh activation on bottleneck (default: False for linear)")
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                       help="Weight decay (L2 penalty on weights) for Adam optimizer (default: 0.0)")
     parser.add_argument("--output_dir", type=str, default=None,
                        help="Custom output directory (if not provided, creates timestamped directory)")
 
@@ -319,8 +407,6 @@ def main():
         (output_dir / "checkpoints").mkdir(exist_ok=True)
         (output_dir / "logs").mkdir(exist_ok=True)
         (output_dir / "config").mkdir(exist_ok=True)
-    else:
-        output_dir = create_timestamped_output_dir("train_run_memmap")
 
     print("=" * 60)
     print("EMBEDDAGEDDON TRAINING (MEMORY-MAPPED)")
@@ -352,7 +438,14 @@ def main():
             device=device,
             use_amp=args.use_amp,
             precision=args.precision,
-            num_workers=args.num_workers
+            num_workers=args.num_workers,
+            l2_penalty_weight=args.l2_penalty_weight,
+            use_onecycle=args.use_onecycle,
+            pct_start=args.pct_start,
+            div_factor=args.div_factor,
+            final_div_factor=args.final_div_factor,
+            use_tanh=args.use_tanh,
+            weight_decay=args.weight_decay
         )
 
         print("=" * 60)
