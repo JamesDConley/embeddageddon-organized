@@ -12,8 +12,10 @@ import logging
 import os
 import pickle
 import random
+import time
 
 # Third-party imports
+import bitsandbytes as bnb
 import torch
 from tqdm import tqdm
 from transformers import AutoConfig, get_scheduler
@@ -120,163 +122,168 @@ def main():
     
     # Save arguments to JSON file in output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    args_dict = vars(args)
-    args_json_path = os.path.join(args.output_dir, "args_used.json")
-    with open(args_json_path, 'w') as f:
-        json.dump(args_dict, f, indent=2)
-    print(f"Arguments saved to: {args_json_path}")
-    
-    device = setup_device(args.device)
-    
+    try:
+        args_dict = vars(args)
+        args_json_path = os.path.join(args.output_dir, "args_used.json")
+        with open(args_json_path, 'w') as f:
+            json.dump(args_dict, f, indent=2)
+        print(f"Arguments saved to: {args_json_path}")
+        
+        device = setup_device(args.device)
+        
 
-    # Check if embeddageddon embeddings should be used
-    use_embeddageddon = (args.embedding_file and 
-                        args.embedding_file.lower() != "none" and 
-                        args.embedding_file.strip() != "")
-    
-    # Setup model - with or without embeddageddon embeddings
-    if use_embeddageddon:
-        print(f"Using embeddageddon embeddings from: {args.embedding_file}")
-        if args.model_type == "matformer":
-            model = setup_model_with_embeddageddon_embeddings(
-                BaseMatformer, args.config_name, device, args.embedding_file
-            )
-        elif args.model_type == "weight_based_matformer":
-            model = setup_model_with_embeddageddon_embeddings(
-                WeightBasedMatformer, args.config_name, device, args.embedding_file
-            )
-        else:
-            model = setup_model_with_embeddageddon_embeddings(
-                ModifiedMatformer, args.config_name, device, args.embedding_file
-            )
-    else:
-        print("Using regular model setup (no embeddageddon embeddings)")
-        if args.model_type == "matformer":
-            model = setup_model(BaseMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
-        elif args.model_type == "weight_based_matformer":
-            model = setup_model(WeightBasedMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
-        else:
-            model = setup_model(ModifiedMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-    
-    
-    model.train()
-    total_params = sum(param.numel() for param in model.parameters())
-    print(f"Total number of parameters: {total_params}")
-
-    tokenizer = setup_tokenizer()
-    eval_dataloader, train_dataloader = setup_dataloaders(
-        args.dataset_dir, 
-        args.seed, 
-        tokenizer, 
-        args.max_length, 
-        args.batch_size,
-        eval_samples=args.eval_samples
-    )
-    tracker = TrainingTracker(args.output_dir)
-
-
-    flags = ['s', 'm', 'l', 'xl']
-
-    total_batches_per_epoch = len(train_dataloader)
-    batches_per_subnetwork = int(total_batches_per_epoch * args.num_epochs_per_subnetwork)
-    print(f"batches_per_subnetwork : {batches_per_subnetwork}")
-    if batches_per_subnetwork == 0:
-        batches_per_subnetwork = 1
-
-    num_actual_epochs = len(flags) * args.num_epochs_per_subnetwork
-    total_steps_all_subnetworks = batches_per_subnetwork * len(flags)
-    num_warmup_steps = int(0.1 * total_steps_all_subnetworks)
-    scheduler = get_scheduler(
-            "cosine",
-            optimizer=optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=total_steps_all_subnetworks,
-        )
-    global_step = 0
-
-    data_iter = iter(train_dataloader)
-    for sub_network in flags:
-        model.configure_subnetwork(sub_network)
-        subnetwork_loss = 0.0
-        subnetwork_main_loss = 0.0
-        subnetwork_covariance_loss = 0.0
-        num_batches = 0
-        print(f"batches_per_subnetwork : {batches_per_subnetwork}")
-        for local_step in tqdm(range(batches_per_subnetwork), dynamic_ncols=True):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_dataloader)
-                batch = next(data_iter)
-                
-            input_ids = batch["input_ids"].to(model.device)
-            attention_mask = batch["attention_mask"].to(model.device)
-            labels = batch["labels"].to(model.device)
-            
-            # Determine which subnetwork to use for this batch
-            if args.random_subnetwork_order:
-                current_subnetwork = random.choice(flags)
-                model.configure_subnetwork(current_subnetwork)
+        # Check if embeddageddon embeddings should be used
+        use_embeddageddon = (args.embedding_file and 
+                            args.embedding_file.lower() != "none" and 
+                            args.embedding_file.strip() != "")
+        
+        # Setup model - with or without embeddageddon embeddings
+        if use_embeddageddon:
+            print(f"Using embeddageddon embeddings from: {args.embedding_file}")
+            if args.model_type == "matformer":
+                model = setup_model_with_embeddageddon_embeddings(
+                    BaseMatformer, args.config_name, device, args.embedding_file
+                )
+            elif args.model_type == "weight_based_matformer":
+                model = setup_model_with_embeddageddon_embeddings(
+                    WeightBasedMatformer, args.config_name, device, args.embedding_file
+                )
             else:
-                current_subnetwork = sub_network
+                model = setup_model_with_embeddageddon_embeddings(
+                    ModifiedMatformer, args.config_name, device, args.embedding_file
+                )
+        else:
+            print("Using regular model setup (no embeddageddon embeddings)")
+            if args.model_type == "matformer":
+                model = setup_model(BaseMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
+            elif args.model_type == "weight_based_matformer":
+                model = setup_model(WeightBasedMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
+            else:
+                model = setup_model(ModifiedMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
+        
+        optimizer = bnb.optim.Adam8bit(model.parameters(), lr=args.learning_rate)
+        
+        
+        model.train()
+        total_params = sum(param.numel() for param in model.parameters())
+        print(f"Total number of parameters: {total_params}")
 
-            precision_context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
-            scaler = torch.amp.GradScaler('cuda')
-            
-            # Forward pass with appropriate precision context
-            with precision_context:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                main_loss = outputs.loss
-                
-                if args.model_type != "matformer":
-                    # Get covariance loss
-                    covariance_loss = model.get_covariance_loss()
+        tokenizer = setup_tokenizer()
+        eval_dataloader, train_dataloader = setup_dataloaders(
+            args.dataset_dir, 
+            args.seed, 
+            tokenizer, 
+            args.max_length, 
+            args.batch_size,
+            eval_samples=args.eval_samples
+        )
+        tracker = TrainingTracker(args.output_dir)
+
+
+        flags = ['s', 'm', 'l', 'xl']
+
+        total_batches_per_epoch = len(train_dataloader)
+        batches_per_subnetwork = int(total_batches_per_epoch * args.num_epochs_per_subnetwork)
+        print(f"batches_per_subnetwork : {batches_per_subnetwork}")
+        if batches_per_subnetwork == 0:
+            batches_per_subnetwork = 1
+
+        num_actual_epochs = len(flags) * args.num_epochs_per_subnetwork
+        total_steps_all_subnetworks = batches_per_subnetwork * len(flags)
+        num_warmup_steps = int(0.1 * total_steps_all_subnetworks)
+        scheduler = get_scheduler(
+                "cosine",
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=total_steps_all_subnetworks,
+            )
+        global_step = 0
+
+        data_iter = iter(train_dataloader)
+        for sub_network in flags:
+            model.configure_subnetwork(sub_network)
+            subnetwork_loss = 0.0
+            subnetwork_main_loss = 0.0
+            subnetwork_covariance_loss = 0.0
+            num_batches = 0
+            print(f"batches_per_subnetwork : {batches_per_subnetwork}")
+            for local_step in tqdm(range(batches_per_subnetwork), dynamic_ncols=True):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(train_dataloader)
+                    batch = next(data_iter)
                     
-                    # Compute total loss
-                    if covariance_loss is not None and args.covariance_loss_weight > 0:
-                        total_loss = main_loss + (args.covariance_loss_weight * covariance_loss)
+                input_ids = batch["input_ids"].to(model.device)
+                attention_mask = batch["attention_mask"].to(model.device)
+                labels = batch["labels"].to(model.device)
+                
+                # Determine which subnetwork to use for this batch
+                if args.random_subnetwork_order:
+                    current_subnetwork = random.choice(flags)
+                    model.configure_subnetwork(current_subnetwork)
+                else:
+                    current_subnetwork = sub_network
+
+                precision_context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
+                scaler = torch.amp.GradScaler('cuda')
+                
+                # Forward pass with appropriate precision context
+                with precision_context:
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    main_loss = outputs.loss
+                    
+                    if args.model_type != "matformer":
+                        # Get covariance loss
+                        covariance_loss = model.get_covariance_loss()
+                        
+                        # Compute total loss
+                        if covariance_loss is not None and args.covariance_loss_weight > 0:
+                            total_loss = main_loss + (args.covariance_loss_weight * covariance_loss)
+                        else:
+                            total_loss = main_loss
+                            covariance_loss = torch.tensor(0.0, device=device)
                     else:
                         total_loss = main_loss
                         covariance_loss = torch.tensor(0.0, device=device)
-                else:
-                    total_loss = main_loss
-                    covariance_loss = torch.tensor(0.0, device=device)
+                
+                optimizer.zero_grad()
+                scaler.scale(total_loss).backward()
+                if hasattr(model, 'zero_non_slice_gradients'):
+                    model.zero_non_slice_gradients()
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+
+                current_total_loss = total_loss.item()
+                current_main_loss = main_loss.item()
+                current_covariance_loss = covariance_loss.item()
+                
+                subnetwork_loss += current_total_loss
+                subnetwork_main_loss += current_main_loss
+                subnetwork_covariance_loss += current_covariance_loss
+                num_batches += 1
+                global_step += 1
+
+                tracker.write_train(epoch=global_step // total_batches_per_epoch, step=global_step,
+                                total_loss=total_loss.item(), main_loss=main_loss.item(),
+                                covariance_loss=covariance_loss.item(), current_subnetwork=current_subnetwork)
             
-            optimizer.zero_grad()
-            scaler.scale(total_loss).backward()
-            if hasattr(model, 'zero_non_slice_gradients'):
-                model.zero_non_slice_gradients()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            epoch = global_step // total_batches_per_epoch
+            eval_losses = evaluate_model(model, eval_dataloader, flags)
+            for flag, loss_dict in eval_losses.items():
+                tracker.write_eval(epoch=epoch, step=global_step, total_loss=loss_dict['total_loss'],
+                                main_loss=loss_dict['main_loss'], covariance_loss=loss_dict['covariance_loss'],
+                                current_subnetwork=flag)
+            # Save checkpoint
+            save_checkpoint(model, optimizer, scheduler, epoch, global_step, sub_network, args.output_dir)
 
-            current_total_loss = total_loss.item()
-            current_main_loss = main_loss.item()
-            current_covariance_loss = covariance_loss.item()
-            
-            subnetwork_loss += current_total_loss
-            subnetwork_main_loss += current_main_loss
-            subnetwork_covariance_loss += current_covariance_loss
-            num_batches += 1
-            global_step += 1
-
-            tracker.write_train(epoch=global_step // total_batches_per_epoch, step=global_step,
-                              total_loss=total_loss.item(), main_loss=main_loss.item(),
-                              covariance_loss=covariance_loss.item(), current_subnetwork=current_subnetwork)
-        
-        epoch = global_step // total_batches_per_epoch
-        eval_losses = evaluate_model(model, eval_dataloader, flags)
-        for flag, loss_dict in eval_losses.items():
-            tracker.write_eval(epoch=epoch, step=global_step, total_loss=loss_dict['total_loss'],
-                             main_loss=loss_dict['main_loss'], covariance_loss=loss_dict['covariance_loss'],
-                             current_subnetwork=flag)
-        # Save checkpoint
-        save_checkpoint(model, optimizer, scheduler, epoch, global_step, sub_network, args.output_dir)
-
-    save_final_model(model, tokenizer, args.output_dir)
-    tracker.close_files()
+        save_final_model(model, tokenizer, args.output_dir)
+        tracker.close_files()
+    except:
+        print(f"Error processing, removing output directory in 5 seconds.")
+        time.sleep(5)
+        os.rmdir(args.output_dir)
 
 
 if __name__ == "__main__":
