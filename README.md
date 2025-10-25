@@ -28,3 +28,10 @@ The memmap script I also find to get poor GPU utilization. There's definitely op
 
 # Setup a Training Dataset
 `python src/generate_dataset.py --output_dir data/llm_datasets/redpajama_small`
+
+# Parameter Counts
+
+S - 
+M - 1,377,246,976
+L - 6,057,565,696
+XL - 25,092,365,312

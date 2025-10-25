@@ -12,6 +12,7 @@ import logging
 import os
 import pickle
 import random
+import shutil
 import time
 
 # Third-party imports
@@ -283,7 +284,9 @@ def main():
     except:
         print(f"Error processing, removing output directory in 5 seconds.")
         time.sleep(5)
-        os.rmdir(args.output_dir)
+        shutil.rmtree(args.output_dir)
+        print(f"Raising Error")
+        raise
 
 
 if __name__ == "__main__":

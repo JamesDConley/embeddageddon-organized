@@ -24,7 +24,7 @@ python src/llm_train.py \
     --learning_rate 1e-4 \
     --seed 42 \
     --embedding_file data/embeddageddon_embeddings/100_epochs_8192_batch/embeddageddon_embeddings_xl_7168d.pkl \
-    --use_fp8 \
+    --device cpu \
     --random_subnetwork_order
 
 echo ""
