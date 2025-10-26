@@ -20,8 +20,8 @@ import bitsandbytes as bnb
 import torch
 from tqdm import tqdm
 from transformers import AutoConfig, get_scheduler
-
-from transformer_engine.common import recipe
+from accelerate import Accelerator
+from accelerate.utils import TERecipeKwargs
 
 # Local MatFormer imports
 from llm.frozen_matformer import ModifiedLlamaForCausalLM as ModifiedMatformer
@@ -119,6 +119,14 @@ def main():
     parser = setup_parser()
     parser.add_argument("--embedding_file",
                        help="File containing embeddageddon embeddings. Must match the model configs hidden dim")
+    parser.add_argument("--use_fp8", action="store_true",
+                       help="Enable FP8 mixed precision training with TransformerEngine")
+    parser.add_argument("--fp8_format", type=str, default="HYBRID", choices=["HYBRID", "E4M3", "E5M2"],
+                       help="FP8 format to use (default: HYBRID for training)")
+    parser.add_argument("--fp8_amax_history_len", type=int, default=1024,
+                       help="Length of history for FP8 scaling factor computation")
+    parser.add_argument("--fp8_amax_compute_algo", type=str, default="most_recent", choices=["max", "most_recent"],
+                       help="Algorithm for FP8 scaling factor computation")
     args = parser.parse_args()
     
     # Save arguments to JSON file in output directory
@@ -130,9 +138,31 @@ def main():
             json.dump(args_dict, f, indent=2)
         print(f"Arguments saved to: {args_json_path}")
         
-        device = setup_device(args.device)
+        # Initialize Accelerator with optional FP8 support
+        if args.use_fp8:
+            # Configure FP8 with TransformerEngine
+            te_kwargs = TERecipeKwargs(
+                fp8_format=args.fp8_format,
+                amax_history_len=args.fp8_amax_history_len,
+                amax_compute_algo=args.fp8_amax_compute_algo,
+                use_autocast_during_eval=False,  # Better metrics during eval
+            )
+            accelerator = Accelerator(
+                mixed_precision="fp8",
+                gradient_accumulation_steps=1,
+                kwargs_handlers=[te_kwargs]
+            )
+            print(f"Using FP8 mixed precision with TransformerEngine (format: {args.fp8_format})")
+        else:
+            # Use BF16 mixed precision
+            accelerator = Accelerator(
+                mixed_precision="bf16",
+                gradient_accumulation_steps=1,
+            )
+            print("Using BF16 mixed precision")
         
-
+        device = accelerator.device
+        
         # Check if embeddageddon embeddings should be used
         use_embeddageddon = (args.embedding_file and 
                             args.embedding_file.lower() != "none" and 
@@ -162,8 +192,8 @@ def main():
             else:
                 model = setup_model(ModifiedMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
         
+        # Use BitsAndBytes 8-bit optimizer
         optimizer = bnb.optim.Adam8bit(model.parameters(), lr=args.learning_rate)
-        
         
         model.train()
         total_params = sum(param.numel() for param in model.parameters())
@@ -198,6 +228,12 @@ def main():
                 num_warmup_steps=num_warmup_steps,
                 num_training_steps=total_steps_all_subnetworks,
             )
+        
+        # Prepare model, optimizer, dataloaders, and scheduler with Accelerate
+        model, optimizer, train_dataloader, eval_dataloader, scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, eval_dataloader, scheduler
+        )
+        
         global_step = 0
 
         data_iter = iter(train_dataloader)
@@ -226,34 +262,30 @@ def main():
                 else:
                     current_subnetwork = sub_network
 
-                precision_context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
-                scaler = torch.amp.GradScaler('cuda')
+                # Forward pass - Accelerate handles mixed precision automatically
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                main_loss = outputs.loss
                 
-                # Forward pass with appropriate precision context
-                with precision_context:
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    main_loss = outputs.loss
+                if args.model_type != "matformer":
+                    # Get covariance loss
+                    covariance_loss = model.get_covariance_loss()
                     
-                    if args.model_type != "matformer":
-                        # Get covariance loss
-                        covariance_loss = model.get_covariance_loss()
-                        
-                        # Compute total loss
-                        if covariance_loss is not None and args.covariance_loss_weight > 0:
-                            total_loss = main_loss + (args.covariance_loss_weight * covariance_loss)
-                        else:
-                            total_loss = main_loss
-                            covariance_loss = torch.tensor(0.0, device=device)
+                    # Compute total loss
+                    if covariance_loss is not None and args.covariance_loss_weight > 0:
+                        total_loss = main_loss + (args.covariance_loss_weight * covariance_loss)
                     else:
                         total_loss = main_loss
-                        covariance_loss = torch.tensor(0.0, device=device)
+                        covariance_loss = torch.tensor(0.0, device=accelerator.device)
+                else:
+                    total_loss = main_loss
+                    covariance_loss = torch.tensor(0.0, device=accelerator.device)
                 
                 optimizer.zero_grad()
-                scaler.scale(total_loss).backward()
+                # Use accelerator.backward() instead of scaler
+                accelerator.backward(total_loss)
                 if hasattr(model, 'zero_non_slice_gradients'):
                     model.zero_non_slice_gradients()
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 scheduler.step()
 
                 current_total_loss = total_loss.item()
@@ -271,15 +303,15 @@ def main():
                                 covariance_loss=covariance_loss.item(), current_subnetwork=current_subnetwork)
             
             epoch = global_step // total_batches_per_epoch
-            eval_losses = evaluate_model(model, eval_dataloader, flags)
+            eval_losses = evaluate_model(model, eval_dataloader, flags, accelerator)
             for flag, loss_dict in eval_losses.items():
                 tracker.write_eval(epoch=epoch, step=global_step, total_loss=loss_dict['total_loss'],
                                 main_loss=loss_dict['main_loss'], covariance_loss=loss_dict['covariance_loss'],
                                 current_subnetwork=flag)
-            # Save checkpoint
-            save_checkpoint(model, optimizer, scheduler, epoch, global_step, sub_network, args.output_dir)
+            # Save checkpoint - unwrap model for saving
+            save_checkpoint(accelerator.unwrap_model(model), optimizer, scheduler, epoch, global_step, sub_network, args.output_dir)
 
-        save_final_model(model, tokenizer, args.output_dir)
+        save_final_model(accelerator.unwrap_model(model), tokenizer, args.output_dir)
         tracker.close_files()
     except:
         print(f"Error processing, removing output directory in 5 seconds.")

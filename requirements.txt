@@ -1,3 +1,4 @@
+accelerate
 bitsandbytes
 huggingface_hub
 numpy
@@ -5,5 +6,5 @@ pandas
 safetensors
 torch
 tqdm
-transformer_engine[pytorch]
+transformer-engine[pytorch]
 transformers

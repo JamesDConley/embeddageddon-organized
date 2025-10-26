@@ -108,7 +108,7 @@ def setup_dataloaders(dataset_dir, seed, tokenizer, max_length, batch_size, eval
     )
     return eval_dataloader, train_dataloader
 
-def evaluate_model(model, eval_dataloader, flags, disable_amp=False):
+def evaluate_model(model, eval_dataloader, flags, accelerator=None):
     """
     Evaluate the model on the evaluation dataset for each subnetwork size.
     
@@ -116,7 +116,7 @@ def evaluate_model(model, eval_dataloader, flags, disable_amp=False):
         model: The model to evaluate.
         eval_dataloader: DataLoader for evaluation data.
         flags (list): List of subnetwork flags to evaluate (e.g., ['s', 'm', 'l', 'xl']).
-        disable_amp (bool, optional): Whether to disable automatic mixed precision. Defaults to False.
+        accelerator: Accelerator instance for handling device placement and mixed precision.
         
     Returns:
         dict: Dictionary mapping each flag to its losses {'flag': {'main_loss': float, 'covariance_loss': float, 'total_loss': float}}.
@@ -132,19 +132,15 @@ def evaluate_model(model, eval_dataloader, flags, disable_amp=False):
             total_combined_loss = 0.0
             
             for batch in tqdm(eval_dataloader, dynamic_ncols=True):
-                input_ids = batch["input_ids"].to(model.device)
-                attention_mask = batch["attention_mask"].to(model.device)
-                labels = batch["labels"].to(model.device)
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
+                labels = batch["labels"]
 
                 # Configure the subnetwork for the flag
                 model.configure_subnetwork(flag)
 
-                # Forward pass with optional mixed precision
-                if disable_amp:
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                else:
-                    with torch.amp.autocast('cuda'):
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                # Forward pass - Accelerate handles mixed precision automatically
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 
                 main_loss = outputs.loss
                 
@@ -155,10 +151,12 @@ def evaluate_model(model, eval_dataloader, flags, disable_amp=False):
                         combined_loss = main_loss + covariance_loss
                     else:
                         combined_loss = main_loss
-                        covariance_loss = torch.tensor(0.0, device=model.device)
+                        device = accelerator.device if accelerator else model.device
+                        covariance_loss = torch.tensor(0.0, device=device)
                 else:
                     combined_loss = main_loss
-                    covariance_loss = torch.tensor(0.0, device=model.device)
+                    device = accelerator.device if accelerator else model.device
+                    covariance_loss = torch.tensor(0.0, device=device)
                 
                 total_main_loss += main_loss.item()
                 total_covariance_loss += covariance_loss.item()
