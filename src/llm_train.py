@@ -20,8 +20,8 @@ import bitsandbytes as bnb
 import torch
 from tqdm import tqdm
 from transformers import AutoConfig, get_scheduler
-
-from transformer_engine.common import recipe
+# import transformer_engine.pytorch as te
+# from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling
 
 # Local MatFormer imports
 from llm.frozen_matformer import ModifiedLlamaForCausalLM as ModifiedMatformer
@@ -39,6 +39,47 @@ from llm.train import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def convert_linear_to_te_linear(module):
+    """Recursively convert all torch.nn.Linear layers to Transformer Engine Linear layers.
+    
+    This function walks through the model and replaces all torch.nn.Linear layers
+    with te.Linear layers while preserving the weights and biases.
+    
+    Args:
+        module: PyTorch module to convert
+        
+    Returns:
+        Modified module with TE Linear layers
+    """
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.Linear):
+            # Create a new TE Linear layer with the same dimensions
+            in_features = child.in_features
+            out_features = child.out_features
+            has_bias = child.bias is not None
+            
+            # Create TE Linear layer
+            te_linear = te.Linear(
+                in_features=in_features,
+                out_features=out_features,
+                bias=has_bias,
+                params_dtype=child.weight.dtype
+            )
+            
+            # Copy weights and biases
+            te_linear.weight.data.copy_(child.weight.data)
+            if has_bias:
+                te_linear.bias.data.copy_(child.bias.data)
+            
+            # Replace the layer
+            setattr(module, name, te_linear)
+        else:
+            # Recursively convert child modules
+            convert_linear_to_te_linear(child)
+    
+    return module
 
 
 def load_embeddageddon_embeddings(path):
@@ -119,6 +160,16 @@ def main():
     parser = setup_parser()
     parser.add_argument("--embedding_file",
                        help="File containing embeddageddon embeddings. Must match the model configs hidden dim")
+    parser.add_argument("--use_fp8", action="store_true", default=False,
+                       help="Enable FP8 training via Transformer Engine")
+    parser.add_argument("--fp8_recipe", type=str, default="MXFP8",
+                       help="FP8 recipe type: MXFP8 (block scaling) or DELAYED (delayed scaling)")
+    parser.add_argument("--fp8_format", type=str, default="HYBRID",
+                       help="FP8 format: HYBRID (E4M3 forward, E5M2 backward), E4M3, or E5M2")
+    parser.add_argument("--fp8_amax_history_len", type=int, default=16,
+                       help="Length of amax history for FP8 scaling (DELAYED recipe only)")
+    parser.add_argument("--fp8_amax_compute_algo", type=str, default="max",
+                       help="Algorithm for computing amax in FP8 (DELAYED recipe only)")
     args = parser.parse_args()
     
     # Save arguments to JSON file in output directory
@@ -161,6 +212,31 @@ def main():
                 model = setup_model(WeightBasedMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
             else:
                 model = setup_model(ModifiedMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
+        
+        # Convert model to use Transformer Engine Linear layers if FP8 is enabled
+        if args.use_fp8:
+            # print("Converting model to use Transformer Engine Linear layers for FP8 training...")
+            # model = convert_linear_to_te_linear(model)
+            # print("Conversion complete!")
+            
+            # # Setup FP8 recipe based on type
+            # fp8_format = getattr(Format, args.fp8_format)
+            
+            # if args.fp8_recipe == "MXFP8":
+            #     fp8_recipe = MXFP8BlockScaling(fp8_format=fp8_format)
+            #     print(f"MXFP8 recipe configured: format={args.fp8_format}")
+            # else:  # DELAYED
+            #     fp8_recipe = DelayedScaling(
+            #         fp8_format=fp8_format,
+            #         amax_history_len=args.fp8_amax_history_len,
+            #         amax_compute_algo=args.fp8_amax_compute_algo
+            #     )
+            #     print(f"DelayedScaling recipe configured: format={args.fp8_format}, amax_history_len={args.fp8_amax_history_len}")
+            print("FP8 currently not supported :( maybe ask the transformer engine team nicely for SM120 support")
+            exit()
+        else:
+            fp8_recipe = None
+            print("FP8 training disabled")
         
         optimizer = bnb.optim.Adam8bit(model.parameters(), lr=args.learning_rate)
         
@@ -226,8 +302,14 @@ def main():
                 else:
                     current_subnetwork = sub_network
 
-                precision_context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
-                scaler = torch.amp.GradScaler('cuda')
+                # Setup precision context based on FP8 or BF16
+                if args.use_fp8:
+                    # Use FP8 autocast for forward pass
+                    precision_context = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
+                    scaler = torch.amp.GradScaler('cuda')
+                else:
+                    precision_context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
+                    scaler = torch.amp.GradScaler('cuda')
                 
                 # Forward pass with appropriate precision context
                 with precision_context:

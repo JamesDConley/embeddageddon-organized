@@ -5,5 +5,7 @@ pandas
 safetensors
 torch
 tqdm
-transformer_engine[pytorch]
+#transformer_engine[pytorch]
 transformers
+pyarrow
+fastparquet

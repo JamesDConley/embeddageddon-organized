@@ -17,9 +17,9 @@ echo "=== Training Embeddageddon S Model ==="
 python src/llm_train.py \
     --model_type matformer \
     --config_name llm_configs/embeddageddon_s_896d.json \
-    --dataset_dir ../MatFormer/matformer/datasets/red_pajama \
-    --output_dir data/language_models/embeddageddon/8bitopt_tanh_l2_onecycle_lower_ae_e30lr_embeddageddon_s_$(date +%Y%m%d_%H%M%S) \
-    --batch_size 32 \
+    --dataset_dir data/llm_datasets/fine-web-chinchilla-s \
+    --output_dir data/language_models/embeddageddon/chinchilla_embeddageddon_s_$(date +%Y%m%d_%H%M%S) \
+    --batch_size 48 \
     --max_length 512 \
     --num_epochs_per_subnetwork 0.25 \
     --learning_rate 1e-4 \
@@ -39,9 +39,9 @@ echo "=== Training Equivalent S Model ==="
 python src/llm_train.py \
     --model_type matformer \
     --config_name llm_configs/embeddageddon_s_896d.json \
-    --dataset_dir ../MatFormer/matformer/datasets/red_pajama \
-    --output_dir data/language_models/plain/plain_8bitopt_matformer_s_$(date +%Y%m%d_%H%M%S) \
-    --batch_size 32 \
+    --dataset_dir data/llm_datasets/fine-web-chinchilla-s \
+    --output_dir data/language_models/plain/chinchilla_matformer_s_$(date +%Y%m%d_%H%M%S) \
+    --batch_size 48 \
     --max_length 512 \
     --num_epochs_per_subnetwork 0.25 \
     --learning_rate 1e-4 \

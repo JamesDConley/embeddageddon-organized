@@ -29,9 +29,9 @@ The memmap script I also find to get poor GPU utilization. There's definitely op
 # Setup a Training Dataset
 `python src/generate_dataset.py --output_dir data/llm_datasets/redpajama_small`
 
-# Parameter Counts
+# Parameter Counts - Chinchilla Tokens
 
-S - 
-M - 1,377,246,976
-L - 6,057,565,696
-XL - 25,092,365,312
+S - 413365120 - 8,267,302,400
+M - 1,377,246,976 - 27,544,939,520
+L - 6,057,565,696 - 121,151,313,920
+XL - 25,092,365,312 - 501,847,306,240
