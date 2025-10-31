@@ -3,3 +3,4 @@ venv
 notebooks
 *.pyc
 *cpython*
+*.ipynb_checkpoints

@@ -20,8 +20,8 @@ import bitsandbytes as bnb
 import torch
 from tqdm import tqdm
 from transformers import AutoConfig, get_scheduler
-# import transformer_engine.pytorch as te
-# from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling
 
 # Local MatFormer imports
 from llm.frozen_matformer import ModifiedLlamaForCausalLM as ModifiedMatformer
@@ -75,6 +75,7 @@ def convert_linear_to_te_linear(module):
             
             # Replace the layer
             setattr(module, name, te_linear)
+            del child
         else:
             # Recursively convert child modules
             convert_linear_to_te_linear(child)
@@ -146,13 +147,71 @@ def setup_model_with_embeddageddon_embeddings(model_class, model_config, device,
                 embedding_matrix[token_id] = torch.from_numpy(embedding)
     
     # Replace the embedding layer
-    model.model.embed_tokens = torch.nn.Embedding.from_pretrained(embedding_matrix, freeze=False)
+    with torch.no_grad():
+        model.model.embed_tokens.weight.copy_(embedding_matrix)
     
     logger.info(f"Replaced embedding layer with embeddageddon embeddings")
     logger.info(f"Model vocab size: {vocab_size}, embedding dim: {embedding_dim}")
     
     model.to(device)
     return model
+
+
+def print_model_parameters(model):
+    """Print detailed breakdown of model parameters by layer and component.
+    
+    Args:
+        model: PyTorch model to analyze
+    """
+    print("\n" + "="*80)
+    print("MODEL PARAMETER BREAKDOWN")
+    print("="*80)
+    
+    total_params = 0
+    layer_params = {}
+    
+    for name, param in model.named_parameters():
+        num_params = param.numel()
+        total_params += num_params
+        
+        # Extract layer/component name (first part before the dot or full name if no dot)
+        parts = name.split('.')
+        if len(parts) > 1:
+            # Group by major component (e.g., model.embed_tokens, model.layers.0, etc.)
+            if parts[1] == 'layers' and len(parts) > 2:
+                # For transformer layers, group by layer number
+                layer_key = f"{parts[0]}.{parts[1]}.{parts[2]}"
+            else:
+                # For other components (embeddings, norm, lm_head, etc.)
+                layer_key = f"{parts[0]}.{parts[1]}"
+        else:
+            layer_key = parts[0]
+        
+        if layer_key not in layer_params:
+            layer_params[layer_key] = {'params': 0, 'details': {}}
+        
+        layer_params[layer_key]['params'] += num_params
+        
+        # Store individual parameter details
+        param_name = '.'.join(parts[2:]) if len(parts) > 2 and parts[1] == 'layers' else '.'.join(parts[1:]) if len(parts) > 1 else name
+        layer_params[layer_key]['details'][param_name] = num_params
+    
+    # Print summary by major components
+    for layer_name in sorted(layer_params.keys()):
+        layer_info = layer_params[layer_name]
+        percentage = (layer_info['params'] / total_params) * 100
+        print(f"\n{layer_name}:")
+        print(f"  Total: {layer_info['params']:,} parameters ({percentage:.2f}%)")
+        
+        # Print details for this component (sorted by parameter count)
+        sorted_details = sorted(layer_info['details'].items(), key=lambda x: x[1], reverse=True)
+        for param_name, param_count in sorted_details:
+            param_percentage = (param_count / layer_info['params']) * 100
+            print(f"    - {param_name}: {param_count:,} ({param_percentage:.1f}%)")
+    
+    print("\n" + "="*80)
+    print(f"TOTAL PARAMETERS: {total_params:,}")
+    print("="*80 + "\n")
 
 
 def main():
@@ -215,25 +274,25 @@ def main():
         
         # Convert model to use Transformer Engine Linear layers if FP8 is enabled
         if args.use_fp8:
-            # print("Converting model to use Transformer Engine Linear layers for FP8 training...")
-            # model = convert_linear_to_te_linear(model)
-            # print("Conversion complete!")
+            print("Converting model to use Transformer Engine Linear layers for FP8 training...")
+            model = convert_linear_to_te_linear(model)
+            print("Conversion complete!")
             
-            # # Setup FP8 recipe based on type
-            # fp8_format = getattr(Format, args.fp8_format)
+            # Setup FP8 recipe based on type
+            fp8_format = getattr(Format, args.fp8_format)
             
-            # if args.fp8_recipe == "MXFP8":
-            #     fp8_recipe = MXFP8BlockScaling(fp8_format=fp8_format)
-            #     print(f"MXFP8 recipe configured: format={args.fp8_format}")
-            # else:  # DELAYED
-            #     fp8_recipe = DelayedScaling(
-            #         fp8_format=fp8_format,
-            #         amax_history_len=args.fp8_amax_history_len,
-            #         amax_compute_algo=args.fp8_amax_compute_algo
-            #     )
-            #     print(f"DelayedScaling recipe configured: format={args.fp8_format}, amax_history_len={args.fp8_amax_history_len}")
-            print("FP8 currently not supported :( maybe ask the transformer engine team nicely for SM120 support")
-            exit()
+            if args.fp8_recipe == "MXFP8":
+                fp8_recipe = MXFP8BlockScaling(fp8_format=fp8_format)
+                print(f"MXFP8 recipe configured: format={args.fp8_format}")
+            else:  # DELAYED
+                fp8_recipe = DelayedScaling(
+                    fp8_format=fp8_format,
+                    amax_history_len=args.fp8_amax_history_len,
+                    amax_compute_algo=args.fp8_amax_compute_algo
+                )
+                print(f"DelayedScaling recipe configured: format={args.fp8_format}, amax_history_len={args.fp8_amax_history_len}")
+            # print("FP8 currently not supported :( maybe ask the transformer engine team nicely for SM120 support")
+            # exit()
         else:
             fp8_recipe = None
             print("FP8 training disabled")
@@ -242,15 +301,14 @@ def main():
         
         
         model.train()
-        total_params = sum(param.numel() for param in model.parameters())
-        print(f"Total number of parameters: {total_params}")
+        print_model_parameters(model)
 
         tokenizer = setup_tokenizer()
         eval_dataloader, train_dataloader = setup_dataloaders(
             args.dataset_dir, 
-            args.seed, 
-            tokenizer, 
-            args.max_length, 
+            args.seed,
+            tokenizer,
+            args.max_length,
             args.batch_size,
             eval_samples=args.eval_samples
         )

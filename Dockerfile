@@ -16,9 +16,13 @@ RUN apt update && apt install git --yes
 # Install cuDNN development headers required for TransformerEngine
 RUN apt-get update && apt-get install -y libcudnn9-dev-cuda-12 && rm -rf /var/lib/apt/lists/*
 
-# Install TransformerEngine
-#RUN NVTE_FRAMEWORK=pytorch pip install git+https://github.com/NVIDIA/TransformerEngine.git@stable
-RUN NVTE_FRAMEWORK=pytorch pip install git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.9
+# Install build dependencies for TransformerEngine
+RUN pip3 install pybind11
+
+# Install TransformerEngine from source with SM120 architecture support
+RUN git clone --branch stable --recursive https://github.com/NVIDIA/TransformerEngine.git && \
+    cd TransformerEngine && \
+    NVTE_FRAMEWORK=pytorch NVTE_CUDA_ARCHS=120 pip3 install --no-build-isolation .
 
 # Set the default command to bash
 CMD ["/bin/bash"]

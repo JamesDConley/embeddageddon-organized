@@ -6,7 +6,7 @@ import os
 import torch
 import random
 import numpy as np
-from transformers import AutoTokenizer, LlamaConfig, get_scheduler
+from transformers import AutoTokenizer, AutoConfig, get_scheduler
 from torch.utils.data import DataLoader
 
 
@@ -80,7 +80,7 @@ def setup_model(model_class, model_name="NousResearch/Llama-3.2-1B", max_length=
     """
     # TODO : Prints -> logging throughout this file/project
     print("Loading config...")
-    config = LlamaConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name)
     
     # Update config with custom max sequence length
     config.max_position_embeddings = max_length
