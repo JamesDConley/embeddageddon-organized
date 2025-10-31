@@ -105,7 +105,8 @@ def setup_model_with_embeddageddon_embeddings(model_class, model_config, device,
                 embedding_matrix[token_id] = torch.from_numpy(embedding)
     
     # Replace the embedding layer
-    model.model.embed_tokens = torch.nn.Embedding.from_pretrained(embedding_matrix, freeze=False)
+    with torch.no_grad():
+        model.model.embed_tokens.weight.copy_(embedding_matrix)
     
     logger.info(f"Replaced embedding layer with embeddageddon embeddings")
     logger.info(f"Model vocab size: {vocab_size}, embedding dim: {embedding_dim}")
