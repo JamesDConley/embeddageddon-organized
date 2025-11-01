@@ -31,7 +31,13 @@ The memmap script I also find to get poor GPU utilization. There's definitely op
 
 # Parameter Counts
 
-S - 
-M - 1,377,246,976
-L - 6,057,565,696
-XL - 25,092,365,312
+S - 298_447_744
+M - 1_147_412_224
+L - 5_597_896_192
+XL - 24_173_026_304
+
+# Chinchilla Token Counts
+S  - 5_968_954_880
+M  - 22_948_244_480
+L  - 111_957_923_840
+XL - 483_460_526_080

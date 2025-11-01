@@ -24,7 +24,6 @@ accelerate launch src/llm_train.py \
     --learning_rate 1e-4 \
     --seed 42 \
     --embedding_file data/embeddageddon_embeddings/tanh_l2_onecycle_e30_bs8192_lr0.00001_w8/embeddageddon_embeddings_l_3584d.pkl \
-    --use_fp8 \
     --random_subnetwork_order
 
 echo ""

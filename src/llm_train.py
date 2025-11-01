@@ -41,6 +41,64 @@ from llm.train import (
 logger = logging.getLogger(__name__)
 
 
+def print_model_parameters(model):
+    """Print detailed breakdown of model parameters by layer and component.
+    
+    Args:
+        model: PyTorch model to analyze
+    """
+    print("\n" + "="*80)
+    print("MODEL PARAMETER BREAKDOWN")
+    print("="*80)
+
+    total_params = 0
+    layer_params = {}
+
+    for name, param in model.named_parameters():
+        num_params = param.numel()
+        total_params += num_params
+
+        # Extract layer/component name (first part before the dot or full name if no dot)
+        parts = name.split('.')
+        if len(parts) > 1:
+            # Group by major component (e.g., model.embed_tokens, model.layers.0, etc.)
+            if parts[1] == 'layers' and len(parts) > 2:
+                # For transformer layers, group by layer number
+                layer_key = f"{parts[0]}.{parts[1]}.{parts[2]}"
+            else:
+                # For other components (embeddings, norm, lm_head, etc.)
+                layer_key = f"{parts[0]}.{parts[1]}"
+        else:
+            layer_key = parts[0]
+
+        if layer_key not in layer_params:
+            layer_params[layer_key] = {'params': 0, 'details': {}}
+
+        layer_params[layer_key]['params'] += num_params
+
+        # Store individual parameter details
+        param_name = '.'.join(parts[2:]) if len(parts) > 2 and parts[1] == 'layers' else '.'.join(parts[1:]) if len(parts) > 1 else name
+        layer_params[layer_key]['details'][param_name] = num_params
+
+    # Print summary by major components
+    for layer_name in sorted(layer_params.keys()):
+        layer_info = layer_params[layer_name]
+        percentage = (layer_info['params'] / total_params) * 100
+        print(f"\n{layer_name}:")
+        print(f"  Total: {layer_info['params']:,} parameters ({percentage:.2f}%)")
+
+        # Print details for this component (sorted by parameter count)
+        sorted_details = sorted(layer_info['details'].items(), key=lambda x: x[1], reverse=True)
+        for param_name, param_count in sorted_details:
+            param_percentage = (param_count / layer_info['params']) * 100
+            print(f"    - {param_name}: {param_count:,} ({param_percentage:.1f}%)")
+
+    print("\n" + "="*80)
+    print(f"TOTAL PARAMETERS: {total_params:,}")
+    print("="*80 + "\n")
+
+
+
 def load_embeddageddon_embeddings(path):
     """Load embeddageddon embeddings from the specified path.
     
@@ -197,8 +255,7 @@ def main():
         optimizer = bnb.optim.Adam8bit(model.parameters(), lr=args.learning_rate)
         
         model.train()
-        total_params = sum(param.numel() for param in model.parameters())
-        print(f"Total number of parameters: {total_params}")
+        print_model_parameters(model)
 
         tokenizer = setup_tokenizer()
         eval_dataloader, train_dataloader = setup_dataloaders(
