@@ -28,6 +28,22 @@ python src/llm_train.py \
     --embedding_file data/embeddageddon_embeddings/tanh_l2_onecycle_e30_bs8192_lr0.00001_w8/embeddageddon_embeddings_s_896d.pkl \
     --random_subnetwork_order
 
+python src/llm_train.py \
+    --model_type matformer \
+    --config_name llm_configs/embeddageddon_s_896d.json \
+    --dataset_dir data/llm_datasets/redpajama_small \
+    --output_dir data/language_models/embeddageddon/chinchilla_embeddageddon_s_$(date +%Y%m%d_%H%M%S) \
+    --batch_size 48 \
+    --max_length 512 \
+    --num_epochs_per_subnetwork 0.25 \
+    --learning_rate 1e-4 \
+    --seed 42 \
+    --use_fp8 \
+    --fp8_recipe NVFP4 \
+    --embedding_file data/embeddageddon_embeddings/tanh_l2_onecycle_e30_bs8192_lr0.00001_w8/embeddageddon_embeddings_s_896d.pkl \
+    --random_subnetwork_order
+
+
 echo ""
 echo "============================================"
 echo "Embeddageddon S training completed!"

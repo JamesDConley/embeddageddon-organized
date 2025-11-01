@@ -21,7 +21,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoConfig, get_scheduler
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling
+from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling, NVFP4BlockScaling
 
 # Local MatFormer imports
 from llm.frozen_matformer import ModifiedLlamaForCausalLM as ModifiedMatformer
@@ -45,7 +45,8 @@ def convert_linear_to_te_linear(module):
     """Recursively convert all torch.nn.Linear layers to Transformer Engine Linear layers.
     
     This function walks through the model and replaces all torch.nn.Linear layers
-    with te.Linear layers while preserving the weights and biases.
+    with te.Linear layers while preserving the weights, biases, and weight tying.
+    Special handling for LLaMA models to preserve embedding-lm_head weight tying.
     
     Args:
         module: PyTorch module to convert
@@ -53,32 +54,117 @@ def convert_linear_to_te_linear(module):
     Returns:
         Modified module with TE Linear layers
     """
-    for name, child in module.named_children():
-        if isinstance(child, torch.nn.Linear):
-            # Create a new TE Linear layer with the same dimensions
-            in_features = child.in_features
-            out_features = child.out_features
-            has_bias = child.bias is not None
+    # Step 1: Check for embedding-lm_head weight tying (LLaMA models)
+    embed_weight_id = None
+    lm_head_weight_id = None
+    
+    # Check if this is a LLaMA-style model with weight tying
+    if hasattr(module, 'model') and hasattr(module.model, 'embed_tokens'):
+        embed_weight_id = id(module.model.embed_tokens.weight)
+    
+    if hasattr(module, 'lm_head') and isinstance(module.lm_head, torch.nn.Linear):
+        lm_head_weight_id = id(module.lm_head.weight)
+    
+    # Check if weights are tied
+    weights_are_tied = (embed_weight_id is not None and
+                       lm_head_weight_id is not None and
+                       embed_weight_id == lm_head_weight_id)
+    
+    # Step 2: Identify weight sharing among Linear layers before conversion
+    weight_sharing_map = {}  # Maps id(weight) -> list of (module_path, original_layer)
+    
+    def find_weight_sharing(mod, prefix=''):
+        """Recursively find all weight tensors and track which modules share them."""
+        for name, child in mod.named_children():
+            child_prefix = f"{prefix}.{name}" if prefix else name
+            if isinstance(child, torch.nn.Linear):
+                weight_id = id(child.weight)
+                if weight_id not in weight_sharing_map:
+                    weight_sharing_map[weight_id] = []
+                weight_sharing_map[weight_id].append((child_prefix, child))
+            else:
+                find_weight_sharing(child, child_prefix)
+    
+    find_weight_sharing(module)
+    
+    # Step 3: Convert layers and store the first converted layer for each shared weight
+    converted_layers = {}  # Maps weight_id -> converted te.Linear layer
+    
+    def convert_layer(mod, prefix=''):
+        """Recursively convert Linear to TE Linear."""
+        for name, child in list(mod.named_children()):
+            child_prefix = f"{prefix}.{name}" if prefix else name
             
-            # Create TE Linear layer
-            te_linear = te.Linear(
-                in_features=in_features,
-                out_features=out_features,
-                bias=has_bias,
-                params_dtype=child.weight.dtype
-            )
+            if isinstance(child, torch.nn.Linear):
+                weight_id = id(child.weight)
+                
+                # Create a new TE Linear layer
+                in_features = child.in_features
+                out_features = child.out_features
+                has_bias = child.bias is not None
+                
+                te_linear = te.Linear(
+                    in_features=in_features,
+                    out_features=out_features,
+                    bias=has_bias,
+                    params_dtype=child.weight.dtype
+                )
+                
+                # Copy weights and biases from the original layer
+                te_linear.weight.data.copy_(child.weight.data)
+                if has_bias:
+                    te_linear.bias.data.copy_(child.bias.data)
+                
+                # Store the first converted layer for this weight_id
+                if weight_id not in converted_layers:
+                    converted_layers[weight_id] = te_linear
+                
+                # Replace the layer
+                setattr(mod, name, te_linear)
+                del child
+            else:
+                # Recursively convert child modules
+                convert_layer(child, child_prefix)
+    
+    convert_layer(module)
+    
+    # Step 4: Re-establish weight tying for shared weights among Linear layers
+    for weight_id, layer_info_list in weight_sharing_map.items():
+        if len(layer_info_list) > 1:
+            # Multiple layers shared this weight - need to re-tie
+            primary_te_layer = converted_layers[weight_id]
             
-            # Copy weights and biases
-            te_linear.weight.data.copy_(child.weight.data)
-            if has_bias:
-                te_linear.bias.data.copy_(child.bias.data)
-            
-            # Replace the layer
-            setattr(module, name, te_linear)
-            del child
-        else:
-            # Recursively convert child modules
-            convert_linear_to_te_linear(child)
+            # Navigate to each module and tie its weight to the primary
+            for layer_path, _ in layer_info_list:
+                parts = layer_path.split('.')
+                current_mod = module
+                
+                # Navigate to the parent module
+                for part in parts[:-1]:
+                    current_mod = getattr(current_mod, part)
+                
+                # Get the converted layer
+                converted_layer = getattr(current_mod, parts[-1])
+                
+                # Tie the weight (make them point to the same tensor)
+                if converted_layer is not primary_te_layer:
+                    # Delete the old weight tensor to free memory
+                    old_weight = converted_layer.weight
+                    del old_weight
+                    # Now assign the shared weight
+                    converted_layer.weight = primary_te_layer.weight
+    
+    # Step 5: Re-establish embedding-lm_head weight tying if it existed
+    if weights_are_tied:
+        print("Detected weight tying between embed_tokens and lm_head - preserving after conversion...")
+        # The lm_head has been converted to te.Linear, tie it to embed_tokens
+        if hasattr(module, 'lm_head') and hasattr(module.model, 'embed_tokens'):
+            # Delete the lm_head weight created during conversion
+            old_lm_head_weight = module.lm_head.weight
+            del old_lm_head_weight
+            # Tie to embedding weight
+            module.lm_head.weight = module.model.embed_tokens.weight
+            print(f"Weight tying restored: lm_head.weight now shares {module.model.embed_tokens.weight.numel():,} parameters with embed_tokens")
     
     return module
 
@@ -275,6 +361,7 @@ def main():
         # Convert model to use Transformer Engine Linear layers if FP8 is enabled
         if args.use_fp8:
             print("Converting model to use Transformer Engine Linear layers for FP8 training...")
+            model = model.to(torch.bfloat16)
             model = convert_linear_to_te_linear(model)
             print("Conversion complete!")
             
@@ -284,6 +371,8 @@ def main():
             if args.fp8_recipe == "MXFP8":
                 fp8_recipe = MXFP8BlockScaling(fp8_format=fp8_format)
                 print(f"MXFP8 recipe configured: format={args.fp8_format}")
+            elif args.fp8_recipe == "NVFP4":
+                fp8_recipe = NVFP4BlockScaling(disable_2d_quantization=True)
             else:  # DELAYED
                 fp8_recipe = DelayedScaling(
                     fp8_format=fp8_format,
@@ -364,7 +453,7 @@ def main():
                 if args.use_fp8:
                     # Use FP8 autocast for forward pass
                     precision_context = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
-                    scaler = torch.amp.GradScaler('cuda')
+                    scaler = None# torch.amp.GradScaler('cuda')
                 else:
                     precision_context = torch.amp.autocast('cuda', dtype=torch.bfloat16)
                     scaler = torch.amp.GradScaler('cuda')
@@ -389,11 +478,13 @@ def main():
                         covariance_loss = torch.tensor(0.0, device=device)
                 
                 optimizer.zero_grad()
-                scaler.scale(total_loss).backward()
+                if scaler is not None:
+                    scaler.scale(total_loss).backward()
                 if hasattr(model, 'zero_non_slice_gradients'):
                     model.zero_non_slice_gradients()
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
                 scheduler.step()
 
                 current_total_loss = total_loss.item()

@@ -1,6 +1,8 @@
-#FROM nvcr.io/nvidia/pytorch:25.09-py3
-#FROM nvcr.io/nvidia/pytorch:25.08-py3
-FROM pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
+FROM nvcr.io/nvidia/pytorch:25.09-py3
+
+ENV PATH=/usr/local/cuda-13.0/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH}
+ENV CUDA_HOME=/usr/local/cuda-13.0
 
 # Set working directory
 WORKDIR /app
@@ -9,20 +11,13 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN apt update && apt install git --yes
-
-# Install cuDNN development headers required for TransformerEngine
-RUN apt-get update && apt-get install -y libcudnn9-dev-cuda-12 && rm -rf /var/lib/apt/lists/*
-
-# Install build dependencies for TransformerEngine
-RUN pip3 install pybind11
-
-# Install TransformerEngine from source with SM120 architecture support
-RUN git clone --branch stable --recursive https://github.com/NVIDIA/TransformerEngine.git && \
+RUN git clone --branch main --recursive https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
-    NVTE_FRAMEWORK=pytorch NVTE_CUDA_ARCHS=120 pip3 install --no-build-isolation .
+    CMAKE_CUDA_ARCHITECTURES="80;90;120" \
+    NVTE_FRAMEWORK=pytorch \
+    python -m pip install --no-build-isolation .
 
 # Set the default command to bash
 CMD ["/bin/bash"]
