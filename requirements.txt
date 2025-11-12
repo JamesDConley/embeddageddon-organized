@@ -8,3 +8,5 @@ torch
 tqdm
 transformer-engine[pytorch]
 transformers
+pyarrow
+fastparquet
