@@ -10,3 +10,4 @@ transformer-engine[pytorch]
 transformers
 pyarrow
 fastparquet
+hf_transfer

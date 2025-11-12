@@ -11,13 +11,13 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python dependencies
+RUN pip install --no-build-isolation transformer_engine[pytorch]
 RUN pip install --no-cache-dir -r requirements.txt
-
-RUN git clone --branch main --recursive https://github.com/NVIDIA/TransformerEngine.git && \
-    cd TransformerEngine && \
-    CMAKE_CUDA_ARCHITECTURES="80;90;120" \
-    NVTE_FRAMEWORK=pytorch \
-    python -m pip install --no-build-isolation .
+# RUN git clone --branch main --recursive https://github.com/NVIDIA/TransformerEngine.git && \
+#     cd TransformerEngine && \
+#     CMAKE_CUDA_ARCHITECTURES="80;90;100;120" \
+#     NVTE_FRAMEWORK=pytorch \
+#     python -m pip install --no-build-isolation .
 
 # Set the default command to bash
 CMD ["/bin/bash"]
