@@ -4,11 +4,18 @@ Data class for loading and managing training run data.
 
 import json
 import os
+import torch
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 
 import pandas as pd
+from transformers import AutoTokenizer, AutoConfig
+
+# Import model classes at module level
+from llm.modified_llama import ModifiedLlamaForCausalLM as BaseMatformer
+from llm.weight_based_matformer import ModifiedLlamaForCausalLM as WeightBasedMatformer
+from llm.frozen_matformer import ModifiedLlamaForCausalLM as FrozenMatformer
 
 
 @dataclass
@@ -172,6 +179,127 @@ class TrainingRunData:
         stats = stats.rename(columns={"step_count": "num_steps"})
         
         return stats
+    
+    def load_model(self, device: str = "cuda", model_type: str = "final") -> Any:
+        """
+        Load a trained model from this training run.
+        
+        This method loads either the final model or a checkpoint based on the
+        training configuration stored in args_used.json. It automatically determines
+        the correct model class based on the model_type in the config.
+        
+        Args:
+            device: Device to load the model on (default: "cuda")
+            model_type: Type of model to load. Options:
+                - "final": Load the final trained model (default)
+                - "checkpoint": Load the latest checkpoint
+                - "checkpoint_0", "checkpoint_1", etc.: Load specific checkpoint by index
+                
+        Returns:
+            Loaded model instance ready for inference or further training
+            
+        Raises:
+            ValueError: If model path doesn't exist or model_type is invalid
+            
+        Example:
+            >>> run = load_training_run("data/models/my_run")
+            >>> model = run.load_model(device="cuda")
+            >>> model.eval()
+            >>> # Use model for inference
+        """
+        # Determine which path to load from
+        if model_type == "final":
+            if not self.final_model_path:
+                raise ValueError("Final model not found in training run directory")
+            model_path = self.final_model_path
+            load_from_checkpoint = False
+        elif model_type.startswith("checkpoint"):
+            if not self.checkpoint_paths:
+                raise ValueError("No checkpoints found in training run directory")
+            
+            if model_type == "checkpoint":
+                # Load latest checkpoint
+                checkpoint_path = self.checkpoint_paths[-1]
+            else:
+                # Load specific checkpoint by index
+                try:
+                    idx = int(model_type.split("_")[1])
+                    checkpoint_path = self.checkpoint_paths[idx]
+                except (IndexError, ValueError):
+                    raise ValueError(f"Invalid checkpoint specification: {model_type}")
+            
+            model_path = checkpoint_path
+            load_from_checkpoint = True
+        else:
+            raise ValueError(f"Invalid model_type: {model_type}. Must be 'final', 'checkpoint', or 'checkpoint_N'")
+        
+        # Get model configuration from args
+        if not self.args:
+            raise ValueError("No training arguments found. Cannot determine model type.")
+        
+        config_name = self.args.get("config_name")
+        training_model_type = self.args.get("model_type", "matformer")
+        
+        if not config_name:
+            raise ValueError("config_name not found in training arguments")
+        
+        # Select appropriate model class based on training model type
+        if training_model_type == "matformer":
+            ModelClass = BaseMatformer
+        elif training_model_type == "weight_based_matformer":
+            ModelClass = WeightBasedMatformer
+        elif training_model_type in ["frozen_matformer", "frozen_cov_matformer"]:
+            ModelClass = FrozenMatformer
+        else:
+            raise ValueError(f"Unknown model_type in training args: {training_model_type}")
+        
+        print(f"Loading {training_model_type} from {model_path}...")
+        
+        # Load model
+        if load_from_checkpoint:
+            # Load from checkpoint file
+            config = AutoConfig.from_pretrained(config_name)
+            model = ModelClass(config)
+            
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded checkpoint from epoch {checkpoint.get('epoch')}, step {checkpoint.get('step')}")
+        else:
+            # Load from final model directory (HuggingFace format)
+            model = ModelClass.from_pretrained(model_path)
+        
+        model.to(device)
+        print(f"Model loaded successfully on {device}")
+        
+        return model
+    
+    def load_tokenizer(self) -> AutoTokenizer:
+        """
+        Load the tokenizer used for this training run.
+        
+        Returns:
+            AutoTokenizer instance
+            
+        Raises:
+            ValueError: If tokenizer cannot be found
+            
+        Example:
+            >>> run = load_training_run("data/models/my_run")
+            >>> tokenizer = run.load_tokenizer()
+            >>> tokens = tokenizer("Hello world", return_tensors="pt")
+        """
+        # Try loading from final model directory first
+        if self.final_model_path and Path(self.final_model_path).exists():
+            print(f"Loading tokenizer from {self.final_model_path}")
+            return AutoTokenizer.from_pretrained(self.final_model_path)
+        
+        # Otherwise load from original config
+        config_name = self.args.get("config_name")
+        if not config_name:
+            raise ValueError("Cannot determine tokenizer: config_name not found in training arguments")
+        
+        print(f"Loading tokenizer from {config_name}")
+        return AutoTokenizer.from_pretrained(config_name)
     
     def __repr__(self) -> str:
         """String representation of the training run."""

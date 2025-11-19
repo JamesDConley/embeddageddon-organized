@@ -144,5 +144,19 @@ def setup_parser():
         action="store_true",
         help="Use random subnetwork selection for each batch instead of ordered training (s->m->l->xl)"
     )
+    
+    parser.add_argument(
+        "--freeze_embeddings",
+        action="store_true",
+        help="Freeze the embedding layer during training (no gradient updates)"
+    )
+    
+    parser.add_argument(
+        "--scale_embeddings",
+        type=float,
+        default=1.0,
+        help="Scale factor to divide embeddings by when loading (default: 1.0, no scaling). "
+             "Values > 1.0 will reduce embedding magnitudes, < 1.0 will increase them."
+    )
 
     return parser

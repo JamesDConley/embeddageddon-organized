@@ -13,7 +13,17 @@ import os
 import pickle
 import random
 import shutil
+import sys
 import time
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
 # Third-party imports
 import bitsandbytes as bnb
@@ -118,7 +128,7 @@ def load_embeddageddon_embeddings(path):
     return embeddings
 
 
-def setup_model_with_embeddageddon_embeddings(model_class, model_config, device, embedding_path):
+def setup_model_with_embeddageddon_embeddings(model_class, model_config, device, embedding_path, scale_factor=1.0):
     """Set up model with embeddageddon embeddings instead of regular embeddings.
     
     Args:
@@ -126,6 +136,7 @@ def setup_model_with_embeddageddon_embeddings(model_class, model_config, device,
         model_config (str): Path to model config
         device: Device to place model on
         embedding_path (str): Path to the embeddageddon embeddings file
+        scale_factor (float): Factor to divide embeddings by (default: 1.0, no scaling)
         
     Returns:
         Model instance with embeddageddon embeddings
@@ -139,35 +150,60 @@ def setup_model_with_embeddageddon_embeddings(model_class, model_config, device,
     embedding_dim = first_embedding.shape[0]
     logger.info(f"Embedding dimension: {embedding_dim}")
     
-    # Load model config and modify hidden_size to match embedding dimension
-    
+    # Load model config
     config = AutoConfig.from_pretrained(model_config)
-    assert config.hidden_size == embedding_dim, "Embedding size mismatch!"
+    
+    # Handle dimension mismatch - truncate if embeddings are larger than hidden_size
+    if embedding_dim > config.hidden_size:
+        logger.warning(f"Embedding dimension ({embedding_dim}) is larger than config.hidden_size ({config.hidden_size}). "
+                      f"Truncating embeddings to first {config.hidden_size} dimensions.")
+        # Truncate all embeddings to match config.hidden_size
+        embeddings = {token: emb[:config.hidden_size] for token, emb in embeddings.items()}
+        embedding_dim = config.hidden_size
+    elif embedding_dim < config.hidden_size:
+        raise ValueError(f"Embedding dimension ({embedding_dim}) is smaller than config.hidden_size ({config.hidden_size}). "
+                        f"Cannot proceed - embeddings would need padding which is not supported.")
+    
+    assert config.hidden_size == embedding_dim, "Embedding size mismatch after truncation!"
     
     # Initialize model
     model = model_class(config)
     
-    # Replace embedding layer with embeddageddon embeddings
-    vocab_size = len(embeddings)
-    embedding_matrix = torch.zeros(vocab_size, embedding_dim)
-    
     # Create tokenizer to get token ordering
     tokenizer = setup_tokenizer()
     vocab = tokenizer.get_vocab()
+    total_vocab_size = len(vocab)
     
-    # Fill embedding matrix
+    # Replace embedding layer with embeddageddon embeddings
+    # Start with model's existing embeddings instead of zeros
+    embedding_matrix = model.model.embed_tokens.weight.data.clone()
+    
+    # Track coverage
+    tokens_with_embeddings = 0
+    
+    # Fill embedding matrix with optional scaling
     for token, embedding in embeddings.items():
         if token in vocab:
             token_id = vocab[token]
-            if token_id < vocab_size:
-                embedding_matrix[token_id] = torch.from_numpy(embedding)
+            if token_id < total_vocab_size:
+                embedding_tensor = torch.from_numpy(embedding)
+                if scale_factor != 1.0:
+                    embedding_tensor = embedding_tensor / scale_factor
+                embedding_matrix[token_id] = embedding_tensor
+                tokens_with_embeddings += 1
+    
+    # Log vocabulary coverage statistics
+    coverage_percentage = (tokens_with_embeddings / total_vocab_size) * 100
+    logger.info(f"Vocabulary coverage: {tokens_with_embeddings}/{total_vocab_size} tokens ({coverage_percentage:.2f}%)")
     
     # Replace the embedding layer
     with torch.no_grad():
         model.model.embed_tokens.weight.copy_(embedding_matrix)
     
+    if scale_factor != 1.0:
+        logger.info(f"Scaled embeddings by factor of {scale_factor} (divided values)")
     logger.info(f"Replaced embedding layer with embeddageddon embeddings")
-    logger.info(f"Model vocab size: {vocab_size}, embedding dim: {embedding_dim}")
+    logger.info(f"Model vocab size: {total_vocab_size}, embedding dim: {embedding_dim}")
     
     model.to(device)
     return model
@@ -230,17 +266,20 @@ def main():
         # Setup model - with or without embeddageddon embeddings
         if use_embeddageddon:
             print(f"Using embeddageddon embeddings from: {args.embedding_file}")
+            if args.scale_embeddings != 1.0:
+                print(f"Scaling embeddings by factor {args.scale_embeddings} (dividing values)")
+            
             if args.model_type == "matformer":
                 model = setup_model_with_embeddageddon_embeddings(
-                    BaseMatformer, args.config_name, device, args.embedding_file
+                    BaseMatformer, args.config_name, device, args.embedding_file, args.scale_embeddings
                 )
             elif args.model_type == "weight_based_matformer":
                 model = setup_model_with_embeddageddon_embeddings(
-                    WeightBasedMatformer, args.config_name, device, args.embedding_file
+                    WeightBasedMatformer, args.config_name, device, args.embedding_file, args.scale_embeddings
                 )
             else:
                 model = setup_model_with_embeddageddon_embeddings(
-                    ModifiedMatformer, args.config_name, device, args.embedding_file
+                    ModifiedMatformer, args.config_name, device, args.embedding_file, args.scale_embeddings
                 )
         else:
             print("Using regular model setup (no embeddageddon embeddings)")
@@ -250,6 +289,13 @@ def main():
                 model = setup_model(WeightBasedMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
             else:
                 model = setup_model(ModifiedMatformer, model_name=args.config_name, max_length=args.max_length, device=device)
+        
+        # Freeze embeddings if requested
+        if args.freeze_embeddings:
+            print("Freezing embedding layer (no gradient updates)...")
+            for param in model.model.embed_tokens.parameters():
+                param.requires_grad = False
+            print(f"Embedding parameters frozen: {sum(p.numel() for p in model.model.embed_tokens.parameters()):,}")
         
         # Use BitsAndBytes 8-bit optimizer
         optimizer = bnb.optim.Adam8bit(model.parameters(), lr=args.learning_rate)
